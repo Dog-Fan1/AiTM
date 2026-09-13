@@ -31,7 +31,7 @@ const proxy = createProxyMiddleware({
     target: 'https://login.microsoftonline.com',
     changeOrigin: true,
     secure: true,
-    selfHandleResponse: false,
+    selfHandleResponse: true,
     followRedirects: true,
     
     onProxyReq: (proxyReq, req, res) => {
